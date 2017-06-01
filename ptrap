@@ -3,6 +3,7 @@ set -e
 
 # AREAS OF IMPROVEMENTS
 # - Monitor other IP protocols (e.g. icmp)
+# - Add program options for tc tuning
 # - Save and restore of tc rules
 # - Concurrent execution of multiple istances of this program
 # - Detection of packets from already active connections (iptables "-m hashlimit")
@@ -129,8 +130,8 @@ teardown_tc() {
 
 setup_iptables() {
 	log "Setting up iptables rules..."
-	[ -n "${MONITOR_UDP}" ] && $PRG_IPTABLES -v -A OUTPUT -p udp -m udp -d "$IP_TO_MONITOR" ${PORT_TO_MONITOR:+--dport "$PORT_TO_MONITOR"} -j LOG --log-prefix "$IPTABLES_RULE_COMMENT" -m comment --comment "$IPTABLES_RULE_COMMENT"
-	[ -n "${MONITOR_TCP}" ] && $PRG_IPTABLES -v -A OUTPUT -p tcp -m tcp --syn -d "$IP_TO_MONITOR" ${PORT_TO_MONITOR:+--dport "$PORT_TO_MONITOR"} -j LOG --log-prefix "$IPTABLES_RULE_COMMENT" -m comment --comment "$IPTABLES_RULE_COMMENT"
+	[ -n "${MONITOR_UDP}" ] && $PRG_IPTABLES -A OUTPUT -p udp -m udp -d "$IP_TO_MONITOR" ${PORT_TO_MONITOR:+--dport "$PORT_TO_MONITOR"} -j LOG --log-prefix "$IPTABLES_RULE_COMMENT" -m comment --comment "$IPTABLES_RULE_COMMENT"
+	[ -n "${MONITOR_TCP}" ] && $PRG_IPTABLES -A OUTPUT -p tcp -m tcp --syn -d "$IP_TO_MONITOR" ${PORT_TO_MONITOR:+--dport "$PORT_TO_MONITOR"} -j LOG --log-prefix "$IPTABLES_RULE_COMMENT" -m comment --comment "$IPTABLES_RULE_COMMENT"
 	log "iptables rules setup complete."
 }
 teardown_iptables() {
@@ -141,7 +142,7 @@ teardown_iptables() {
 	done
 	for RULENUMBER in $($PRG_IPTABLES -L OUTPUT --line-numbers | grep "$IPTABLES_RULE_COMMENT" | tac | cut -d' ' -f1 | tr '\n' ' '); do
 		log "Deleting rule $RULENUMBER..."
-		$PRG_IPTABLES -v -D OUTPUT $RULENUMBER
+		$PRG_IPTABLES -D OUTPUT $RULENUMBER
 	done
 	log "iptables rules teardown complete."
 }
@@ -173,7 +174,7 @@ monitor_syslog() {
 		if [ -z "$LSOF_OUTPUT" ]; then
 			log "ERROR: request detected, but lsof did not list any process. Consider tuning the tc limitation parameters." force >&2
 		else
-			log "PROCESS FOUND, LSOF_OUTPUT: $LSOF_OUTPUT" force
+			log "PROCESS REQUEST CAPTURED. lsof output: $LSOF_OUTPUT" force
 		fi
 	done
 }
