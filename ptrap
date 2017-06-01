@@ -1,0 +1,139 @@
+#!/bin/bash
+set -e
+
+PROGRAM_ID_STRING="ip_message_monitor"
+IPTABLES_RULE_COMMENT="${PROGRAM_ID_STRING}_$$"
+TC_HANDLE="1:"
+TC_RATE="10bps"
+TC_BURST="1"
+IP_TO_MONITOR=""
+PORT_TO_MONITOR=""
+TCP_MONITOR=""
+UDP_MONITOR=""
+VERBOSE=""
+
+print_usage () {
+	cat <<-EOF
+		Usage: $0 { [-h] | [-v] [-t] [-u] -i ip_to_monitor [-p port_to_monitor] }
+
+		This program uses iptables rules and tc qdisc to find out which process
+		makes requests to a specific remote IP and port.
+		Currently, only one istance of this script can be executed concurrently.
+		Parameters:
+		* -h: print this help message
+		* -v: be verbose
+		* -t: monitor TCP connections
+		* -u: monitor UDP messages
+		* -i: remote IP to monitor
+		* -p: remote PORT to monitor
+	EOF
+}
+
+log () {
+	MESSAGE="$1"
+	FORCE_LOG="$2"
+	PREFIX="[$(date '+%Y-%m-%d, %H:%M:%S.%N')]"
+	[ -n "$VERBOSE" -o -n "$FORCE_LOG" ] && echo "$PREFIX $MESSAGE" || true
+}
+
+log "TODO: dependencies are not checked (ip, iptables, tc)." #TODO check dependencies
+log "TODO: PID file currently unimplemented." #TODO setup PID file, to execute ONLY one istance
+
+while [ $# -gt 0 ]; do
+	unset OPTIND
+	while getopts "i:p:tuhv" OPTNAME; do
+		case "$OPTNAME" in
+			"i") IP_TO_MONITOR="$OPTARG";;
+			"p") PORT_TO_MONITOR="$OPTARG";;
+			"t") TCP_MONITOR="y";;
+			"u") UDP_MONITOR="y";;
+			"h") print_usage; exit 0;;
+			"v") VERBOSE="y";;
+			*) log "Error during option parsing. Exiting."; exit -1
+		esac
+	done
+	shift $((OPTIND-1))
+
+	if [ $# -gt 0 ]; then
+		log "Ignoring extra option, \"$1\""
+		shift 1
+	fi
+done
+
+log "TODO: no sanity check on arguments" force #TODO arguments sanity checks
+
+
+log "Program parameters:"
+log "- IP_TO_MONITOR: $IP_TO_MONITOR"
+log "- PORT_TO_MONITOR: $PORT_TO_MONITOR"
+log "- TCP_MONITOR: $TCP_MONITOR"
+log "- UDP_MONITOR: $UDP_MONITOR"
+log "- IPTABLES_RULE_COMMENT: $IPTABLES_RULE_COMMENT"
+log "- PID_FILE: #unimplemented#"
+
+OUTPUT_DEVICE="$(ip route get 10.10.41.71 | head -n1 | grep -o -E "dev \w*\s" | cut -d' ' -f2)"
+log "- OUTPUT_DEVICE: $OUTPUT_DEVICE (auto detected)"
+
+setup_tc () {
+	log "Setting up tc..."
+	tc qdisc del dev "$OUTPUT_DEVICE" root || log "No root qdisc present. Skipping."
+	tc qdisc add dev "$OUTPUT_DEVICE" root handle "$TC_HANDLE" htb default 30
+	tc class add dev "$OUTPUT_DEVICE" parent "$TC_HANDLE" classid "${TC_HANDLE}1" htb rate $TC_RATE ceil $TC_RATE burst $TC_BURST cburst $TC_BURST
+	tc filter add dev "$OUTPUT_DEVICE" parent "$TC_HANDLE" protocol ip u32 match ip dst "$IP_TO_MONITOR" flowid "${TC_HANDLE}1" #TODO add ip dport match
+	log "tc setup complete.."
+}
+teardown_tc() {
+	log "Tearing down tc..."
+	tc qdisc del dev "$OUTPUT_DEVICE" root handle "$TC_HANDLE"
+	log "tc teardown complete.".
+}
+
+setup_iptables() {
+	log "Setting up iptables rules..."
+	PROTOCOLS="${TCP_MONITOR:+tcp} ${UDP_MONITOR:+udp}"
+	log "Protocols to monitor: $PROTOCOLS"
+	for PROTOCOL in $PROTOCOLS; do
+		iptables -v -A OUTPUT -p $PROTOCOL -m comment --comment $IPTABLES_RULE_COMMENT -m $PROTOCOL -d $IP_TO_MONITOR --dport $PORT_TO_MONITOR -j LOG --log-prefix "$IPTABLES_RULE_COMMENT"
+	done
+	log "iptables rules setup complete."
+}
+teardown_iptables() {
+	log "Tearing down iptables rules..."
+	log "Current rules:"
+	iptables -L OUTPUT --line-numbers | while read LINE; do
+		log "$LINE"
+	done
+	for RULENUMBER in $(iptables -L OUTPUT --line-numbers | grep "$IPTABLES_RULE_COMMENT" | tac | cut -d' ' -f1 | tr '\n' ' '); do
+		log "Deleting rule $RULENUMBER..."
+		iptables -v -D OUTPUT $RULENUMBER
+	done
+	log "iptables rules teardown complete."
+}
+
+monitor_syslog() {
+	log "Starting syslog monitoring..."
+	tail -f /var/log/messages | grep --line-buffered "$IPTABLES_RULE_COMMENT" | while read LINE; do
+		SOURCE_PORT=$(echo "$LINE" | grep -o -E "SPT=[0-9]+" | cut -d= -f2)
+		SS_LINE=$(ss -aunp | grep -E ":${SOURCE_PORT}" ) || SS_LINE=""
+		if [ -z "$SS_LINE" ]; then
+			log "ERROR: request detected, but ss did not list any process. Consider lowering the tc bandwidth." forced
+		else
+			log "LINE FOUND, ss line: $SS_LINE" forced
+		fi
+	done
+}
+
+echo "OK"
+
+setup () {
+	setup_tc
+	setup_iptables
+}
+teardown () {
+	teardown_iptables
+	teardown_tc
+}
+
+trap teardown EXIT
+setup
+monitor_syslog
