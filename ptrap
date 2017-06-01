@@ -2,9 +2,7 @@
 set -e
 
 # AREAS OF IMPROVEMENTS
-# - Call custom command on packet capture
 # - Monitor other IP protocols (e.g. icmp)
-# - Add program options for tc tuning
 # - Save and restore of tc rules
 # - Concurrent execution of multiple istances of this program
 # - Detection of packets from already active connections (iptables "-m hashlimit")
@@ -13,33 +11,46 @@ PROGRAM_ID_STRING="netportmon"
 IPTABLES_RULE_COMMENT="${PROGRAM_ID_STRING}$$"
 LOCK_DIRECTORY="/var/run/$PROGRAM_ID_STRING"
 TC_DELAY_MS="500"
+TAIL_INTERVAL_S="0.1"
 IP_TO_MONITOR=""
 PORT_TO_MONITOR=""
 MONITOR_TCP=""
 MONITOR_UDP=""
 VERBOSE=""
+USER_SCRIPT=""
 
 print_usage () {
-	cat <<-EOF
-		Usage: $0 { [-h] | [-v] { [-t] | [-u] } -i ip_to_monitor [-p port_to_monitor] [-s delay_ms] }
+cat <<EOF
+Usage: $0 { [-h] | [-v] { [-t] | [-u] } -i ip_to_monitor [-p port_to_monitor] [-s delay_ms] [-e path_to_user_script] }
 
-		This program uses iptables rules and tc qdisc to find out which process
-		makes requests to a specific remote IP and port.
+This program uses iptables rules and tc qdisc to find out which process
+makes requests to a specific remote IP and port.
 
-		IMPORTANT CONSIDERATIONS:
-		* tc rules currently active will be overwritten, at program start
-		* only one istance of this script can be executed concurrently
-		* for TCP port monitoring, only NEW connection are detected
+IMPORTANT CONSIDERATIONS:
+* tc rules currently active will be overwritten, at program start
+* only one istance of this script can be executed concurrently
+* for TCP port monitoring, only NEW connection are detected
+* If too many packets are received, this script might not read them fast
+  enough, and some process informations might be lost. If this happens,
+  you might want to consider tuning one of these parameters to prevent it
+  from happening again, in order of preference:
+    1. Increase the delay_ms parameter
+    2. If using a user script, optimize its execution time
+    3. Edit the TAIL_INTERVAL_S on the top of this script
+* The user script is executed synchronously. To not lose any packet, its
+  execution time should be kept at minimum.
 
-		Parameters:
-		* -h: print this help message
-		* -v: be verbose. If unset, only captured process information will be printed out.
-		* -t: monitor TCP connections
-		* -u: monitor UDP messages
-		* -i: remote IP to monitor
-		* -p: remote PORT to monitor
-		* -s: delay time for matching packets, in milliseconds. default 500
-	EOF
+Parameters:
+* -h: print this help message
+* -v: be verbose. If unset, only captured process information will be printed out.
+* -t: monitor TCP connections
+* -u: monitor UDP messages
+* -i: remote IP to monitor
+* -p: remote PORT to monitor
+* -s: delay time for matching packets, in milliseconds. default 500
+* -e: path to user script, to execute on packet match. The PID of the
+      sending process will be passed to it as parameters.
+EOF
 }
 
 print_failed_dependency () {
@@ -64,7 +75,7 @@ PRG_IP="$(which ip)" || print_failed_dependency "ip"
 
 while [ $# -gt 0 ]; do
 	unset OPTIND
-	while getopts "i:p:tuhvs:" OPTNAME; do
+	while getopts "i:p:tuhvs:e:" OPTNAME; do
 		case "$OPTNAME" in
 			"i") IP_TO_MONITOR="$OPTARG";;
 			"p") PORT_TO_MONITOR="$OPTARG";;
@@ -73,6 +84,7 @@ while [ $# -gt 0 ]; do
 			"h") print_usage; exit 0;;
 			"v") VERBOSE="y";;
 			"s") TC_DELAY_MS="$OPTARG";;
+			"e") USER_SCRIPT="$OPTARG";;
 			*) log "Error during option parsing. Exiting." force >&2; exit -1
 		esac
 	done
@@ -108,6 +120,7 @@ log "- iptables executable path: $PRG_IPTABLES"
 log "- tc executable path: $PRG_TC"
 log "- ip executable path: $PRG_IP"
 log "- lock directory: $LOCK_DIRECTORY"
+log "- User script: ${USER_SCRIPT}"
 
 setup_tc () {
 	log "Setting up tc..."
@@ -121,7 +134,7 @@ setup_tc () {
 }
 teardown_tc() {
 	log "Tearing down tc..."
-	$PRG_TC qdisc del dev "$OUTPUT_INTERFACE" root handle "$TC_HANDLE" || log "Error during tc cleanup. Please manually delete tc root qdisc." force >&2
+	$PRG_TC qdisc del dev "$OUTPUT_INTERFACE" root || log "Error during tc cleanup. Please manually delete tc root qdisc." force >&2
 	log "tc teardown complete.".
 }
 
@@ -164,14 +177,23 @@ teardown_lock_directory () {
 
 monitor_syslog() {
 	log "Starting syslog monitoring..."
-	tail -f -s 0.1 /var/log/messages | grep --line-buffered "$IPTABLES_RULE_COMMENT" | while read LINE; do
+	tail -f -s "$TAIL_INTERVAL_S" /var/log/messages | grep --line-buffered "$IPTABLES_RULE_COMMENT" | while read LINE; do
 		PROTOCOL=$(echo "$LINE" | grep -o -E "PROTO=\w*" | cut -d= -f2) || PROTOCOL=""
 		SOURCE_PORT=$(echo "$LINE" | grep -o -E "SPT=[0-9]+" | cut -d= -f2) || SOURCE_PORT=""
-		LSOF_OUTPUT=$($PRG_LSOF -i ${PROTOCOL}:${SOURCE_PORT} | tail -n+2) || SS_LINE=""
-		if [ -z "$LSOF_OUTPUT" ]; then
-			log "ERROR: request detected, but lsof did not list any process. Consider increasing the delay parameter." force >&2
+		MATCHING_PID=$($PRG_LSOF -i ${PROTOCOL}:${SOURCE_PORT} | tail -n1 | awk '{print $2}') || MATCHING_PID=""
+		if [ -z "$MATCHING_PID" ]; then
+			log "ERROR: request detected, but lsof did not list any process. Read the program help for tips on how to avoid this." force >&2
 		else
-			log "PROCESS REQUEST CAPTURED. lsof output: $LSOF_OUTPUT" force
+			log "PROCESS REQUEST CAPTURED. Matching PID: $MATCHING_PID" force
+			if [ -n "$USER_SCRIPT" ]; then
+				USER_SCRIPT_COMMAND="$USER_SCRIPT $MATCHING_PID"
+				log "Executing user script: $USER_SCRIPT_COMMAND"
+				if bash -c "$USER_SCRIPT_COMMAND"; then
+					log "User script executed successfully."
+				else
+					log "ERROR: user script exited with code $?." forced >&2
+				fi
+			fi
 		fi
 	done
 }
