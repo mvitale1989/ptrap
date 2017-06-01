@@ -5,7 +5,6 @@ set -e
 # - Monitor other IP protocols (e.g. icmp)
 # - Save and restore of tc rules
 # - Concurrent execution of multiple istances of this program
-# - Detection of packets from already active connections (iptables "-m hashlimit")
 
 PROGRAM_ID_STRING="netportmon"
 IPTABLES_RULE_COMMENT="${PROGRAM_ID_STRING}$$"
@@ -16,12 +15,15 @@ IP_TO_MONITOR=""
 PORT_TO_MONITOR=""
 MONITOR_TCP=""
 MONITOR_UDP=""
+TCP_ONLY_SYN=""
+TCP_PACKETS_PER_MINUTE_DEFAULT="6"
+TCP_PACKETS_PER_MINUTE="${TCP_PACKETS_PER_MINUTE_DEFAULT}"
 VERBOSE=""
 USER_SCRIPT=""
 
 print_usage () {
 cat <<EOF
-Usage: $0 { [-h] | [-v] { [-t] | [-u] } -i ip_to_monitor [-p port_to_monitor] [-s delay_ms] [-e path_to_user_script] }
+Usage: $0 { [-h] | [-v] { [ -t [ -c | -n packets_per_minute ] ] | [ -u ] } -i ip_to_monitor [-p port_to_monitor] [-s delay_ms] [-e path_to_user_script] }
 
 This program uses iptables rules and tc qdisc to find out which process
 makes requests to a specific remote IP and port.
@@ -37,13 +39,21 @@ IMPORTANT CONSIDERATIONS:
     1. Increase the delay_ms parameter
     2. If using a user script, optimize its execution time
     3. Edit the TAIL_INTERVAL_S on the top of this script
+  Be aware, however, that this program relies on the process being still
+  alive and waiting for response, after sending an IP packet. If a
+  program sends a packet and then immediately dies, without even waiting
+  for response, this program won't be able to detect it.
 * The user script is executed synchronously. To not lose any packet, its
   execution time should be kept at minimum.
 
 Parameters:
 * -h: print this help message
 * -v: be verbose. If unset, only captured process information will be printed out.
-* -t: monitor TCP connections
+* -t: monitor TCP packets
+* -c: when monitoring TCP packets, detect only new connections
+* -n: when monitoring TCP packets, specify how many packets must be matched at
+      most per minute, to prevent flooding, for each requesting application.
+      Default value is 10. Important: only works when not using the "-c" flags.
 * -u: monitor UDP messages
 * -i: remote IP to monitor
 * -p: remote PORT to monitor
@@ -75,7 +85,7 @@ PRG_IP="$(which ip)" || print_failed_dependency "ip"
 
 while [ $# -gt 0 ]; do
 	unset OPTIND
-	while getopts "i:p:tuhvs:e:" OPTNAME; do
+	while getopts "i:p:tuhvs:e:cn:" OPTNAME; do
 		case "$OPTNAME" in
 			"i") IP_TO_MONITOR="$OPTARG";;
 			"p") PORT_TO_MONITOR="$OPTARG";;
@@ -85,6 +95,8 @@ while [ $# -gt 0 ]; do
 			"v") VERBOSE="y";;
 			"s") TC_DELAY_MS="$OPTARG";;
 			"e") USER_SCRIPT="$OPTARG";;
+			"c") TCP_ONLY_SYN="y";;
+			"n") TCP_PACKETS_PER_MINUTE="$OPTARG";;
 			*) log "Error during option parsing. Exiting." force >&2; exit -1
 		esac
 	done
@@ -104,6 +116,12 @@ elif [ -z "$MONITOR_TCP" -a -z "$MONITOR_UDP" ]; then
 	echo "Select at least one IP protocol to monitor (see options -t and -u)." >&2
 	print_usage
 	exit -4
+elif [ -z "$MONITOR_TCP" ]; then
+	if [ -n "$TCP_ONLY_SYN" -o "$TCP_PACKETS_PER_MINUTE" != "$TCP_PACKETS_PER_MINUTE_DEFAULT" ]; then
+		echo "You must listen for TCP packets (flag -t), in order to use flags -c or -n." >&2
+		print_usage
+		exit -5
+	fi
 fi
 
 PROTOCOLS_TO_MONITOR="${MONITOR_TCP:+tcp} ${MONITOR_UDP:+udp}"
@@ -112,6 +130,13 @@ log "Program parameters:"
 log "- Ip to monitor: $IP_TO_MONITOR"
 log "- Port to monitor: ${PORT_TO_MONITOR:+any}"
 log "- Protocols to monitor: $PROTOCOLS_TO_MONITOR"
+if [ -n "$MONITOR_TCP" ]; then
+	if [ -n "$TCP_ONLY_SYN" ]; then
+		log "- tcp option: only new connections will be matched"
+	else
+		log "- tcp option: every tcp packet will be matched (max $TCP_PACKETS_PER_MINUTE per minute)"
+	fi
+fi
 log "- iptables rule and match identifier: $IPTABLES_RULE_COMMENT"
 log "- TC parameters for netem qdisc: delay ${TC_DELAY_MS}"
 log "- Output interface: $OUTPUT_INTERFACE (auto detected)"
@@ -140,8 +165,10 @@ teardown_tc() {
 
 setup_iptables() {
 	log "Setting up iptables rules..."
+	SYN_ARGS=$( [ -n "$TCP_ONLY_SYN" ] && echo -n "--syn" || echo -n "" )
+	HASHLIMIT_ARGS=$( [ -z "$TCP_ONLY_SYN" ] && echo -n '-m hashlimit --hashlimit '"${TCP_PACKETS_PER_MINUTE}"'/minute --hashlimit-burst 1 --hashlimit-mode dstip,srcport --hashlimit-name '"$PROGRAM_ID_STRING" || echo -n "" )
 	[ -n "${MONITOR_UDP}" ] && $PRG_IPTABLES -A OUTPUT -p udp -m udp -d "$IP_TO_MONITOR" ${PORT_TO_MONITOR:+--dport "$PORT_TO_MONITOR"} -j LOG --log-prefix "$IPTABLES_RULE_COMMENT" -m comment --comment "$IPTABLES_RULE_COMMENT"
-	[ -n "${MONITOR_TCP}" ] && $PRG_IPTABLES -A OUTPUT -p tcp -m tcp --syn -d "$IP_TO_MONITOR" ${PORT_TO_MONITOR:+--dport "$PORT_TO_MONITOR"} -j LOG --log-prefix "$IPTABLES_RULE_COMMENT" -m comment --comment "$IPTABLES_RULE_COMMENT"
+ 	[ -n "${MONITOR_TCP}" ] && $PRG_IPTABLES -A OUTPUT -p tcp -m tcp ${SYN_ARGS} -d "$IP_TO_MONITOR" ${PORT_TO_MONITOR:+--dport "$PORT_TO_MONITOR"} -j LOG --log-prefix "$IPTABLES_RULE_COMMENT" -m comment --comment "$IPTABLES_RULE_COMMENT" ${HASHLIMIT_ARGS}
 	log "iptables rules setup complete."
 }
 teardown_iptables() {
