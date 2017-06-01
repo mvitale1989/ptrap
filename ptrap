@@ -2,6 +2,7 @@
 set -e
 
 # AREAS OF IMPROVEMENTS
+# - Call custom command on packet capture
 # - Monitor other IP protocols (e.g. icmp)
 # - Add program options for tc tuning
 # - Save and restore of tc rules
@@ -11,11 +12,7 @@ set -e
 PROGRAM_ID_STRING="netportmon"
 IPTABLES_RULE_COMMENT="${PROGRAM_ID_STRING}$$"
 LOCK_DIRECTORY="/var/run/$PROGRAM_ID_STRING"
-TC_HANDLE="1:"
-TC_RATE="20bps"
-TC_CEIL="${TC_RATE}"
-TC_BURST="1"
-TC_CBURST="${TC_BURST}"
+TC_DELAY_MS="500"
 IP_TO_MONITOR=""
 PORT_TO_MONITOR=""
 MONITOR_TCP=""
@@ -24,7 +21,7 @@ VERBOSE=""
 
 print_usage () {
 	cat <<-EOF
-		Usage: $0 { [-h] | [-v] { [-t] | [-u] } -i ip_to_monitor [-p port_to_monitor] }
+		Usage: $0 { [-h] | [-v] { [-t] | [-u] } -i ip_to_monitor [-p port_to_monitor] [-s delay_ms] }
 
 		This program uses iptables rules and tc qdisc to find out which process
 		makes requests to a specific remote IP and port.
@@ -41,6 +38,7 @@ print_usage () {
 		* -u: monitor UDP messages
 		* -i: remote IP to monitor
 		* -p: remote PORT to monitor
+		* -s: delay time for matching packets, in milliseconds. default 500
 	EOF
 }
 
@@ -66,7 +64,7 @@ PRG_IP="$(which ip)" || print_failed_dependency "ip"
 
 while [ $# -gt 0 ]; do
 	unset OPTIND
-	while getopts "i:p:tuhv" OPTNAME; do
+	while getopts "i:p:tuhvs:" OPTNAME; do
 		case "$OPTNAME" in
 			"i") IP_TO_MONITOR="$OPTARG";;
 			"p") PORT_TO_MONITOR="$OPTARG";;
@@ -74,6 +72,7 @@ while [ $# -gt 0 ]; do
 			"u") MONITOR_UDP="y";;
 			"h") print_usage; exit 0;;
 			"v") VERBOSE="y";;
+			"s") TC_DELAY_MS="$OPTARG";;
 			*) log "Error during option parsing. Exiting." force >&2; exit -1
 		esac
 	done
@@ -95,8 +94,6 @@ elif [ -z "$MONITOR_TCP" -a -z "$MONITOR_UDP" ]; then
 	exit -4
 fi
 
-log "TODO: the tc burst feature prevents the first packet from being slowed down, thus losing it. A \"token bucket drainer\" subprocess will be implemented." force >&2 #TODO implement TBF drainer process
-
 PROTOCOLS_TO_MONITOR="${MONITOR_TCP:+tcp} ${MONITOR_UDP:+udp}"
 OUTPUT_INTERFACE="$($PRG_IP route get 10.10.41.71 | head -n1 | grep -o -E "dev \w*\s" | cut -d' ' -f2)"
 log "Program parameters:"
@@ -104,7 +101,7 @@ log "- Ip to monitor: $IP_TO_MONITOR"
 log "- Port to monitor: ${PORT_TO_MONITOR:+any}"
 log "- Protocols to monitor: $PROTOCOLS_TO_MONITOR"
 log "- iptables rule and match identifier: $IPTABLES_RULE_COMMENT"
-log "- TC parameters: rate=${TC_RATE}, ceil="${TC_CEIL}", burst=${TC_BURST}, cburst=${TC_CBURST}"
+log "- TC parameters for netem qdisc: delay ${TC_DELAY_MS}"
 log "- Output interface: $OUTPUT_INTERFACE (auto detected)"
 log "- lsof executable path: $PRG_LSOF"
 log "- iptables executable path: $PRG_IPTABLES"
@@ -114,17 +111,17 @@ log "- lock directory: $LOCK_DIRECTORY"
 
 setup_tc () {
 	log "Setting up tc..."
-	U32_CMD="$PRG_TC filter add dev $OUTPUT_INTERFACE parent $TC_HANDLE protocol ip u32"
+	U32_CMD="$PRG_TC filter add dev $OUTPUT_INTERFACE parent 1:0 protocol ip u32"
 	$PRG_TC qdisc del dev "$OUTPUT_INTERFACE" root 2>/dev/null || log "No root qdisc present. Skipping cleanup."
-	$PRG_TC qdisc add dev "$OUTPUT_INTERFACE" root handle "$TC_HANDLE" htb default 30
-	$PRG_TC class add dev "$OUTPUT_INTERFACE" parent "$TC_HANDLE" classid "${TC_HANDLE}1" htb rate $TC_RATE ceil $TC_CEIL burst $TC_BURST cburst $TC_CBURST
-	[ -n "$MONITOR_UDP" ] && $U32_CMD match ip dst "$IP_TO_MONITOR" match ip protocol 17 FF ${PORT_TO_MONITOR:+match ip dport "$PORT_TO_MONITOR" FFFF} flowid "${TC_HANDLE}1"
-	[ -n "$MONITOR_TCP" ] && $U32_CMD match ip dst "$IP_TO_MONITOR" match ip protocol 6 FF ${PORT_TO_MONITOR:+match ip dport "$PORT_TO_MONITOR" FFFF} flowid "${TC_HANDLE}1"
+	$PRG_TC qdisc add dev "$OUTPUT_INTERFACE" root handle "1:0" prio bands 4
+	$PRG_TC qdisc add dev "$OUTPUT_INTERFACE" parent "1:4" handle "2:0" netem delay "${TC_DELAY_MS}ms"
+	[ -n "$MONITOR_UDP" ] && $U32_CMD match ip dst "$IP_TO_MONITOR" match ip protocol 17 FF ${PORT_TO_MONITOR:+match ip dport "$PORT_TO_MONITOR" FFFF} flowid "1:4"
+	[ -n "$MONITOR_TCP" ] && $U32_CMD match ip dst "$IP_TO_MONITOR" match ip protocol 6 FF ${PORT_TO_MONITOR:+match ip dport "$PORT_TO_MONITOR" FFFF} flowid "1:4"
 	log "tc setup complete.."
 }
 teardown_tc() {
 	log "Tearing down tc..."
-	$PRG_TC qdisc del dev "$OUTPUT_INTERFACE" root handle "$TC_HANDLE" || log "Error during tc cleanup. Please manually delete tc rule." force >&2
+	$PRG_TC qdisc del dev "$OUTPUT_INTERFACE" root handle "$TC_HANDLE" || log "Error during tc cleanup. Please manually delete tc root qdisc." force >&2
 	log "tc teardown complete.".
 }
 
@@ -167,12 +164,12 @@ teardown_lock_directory () {
 
 monitor_syslog() {
 	log "Starting syslog monitoring..."
-	tail -f -s 0.2 /var/log/messages | grep --line-buffered "$IPTABLES_RULE_COMMENT" | while read LINE; do
+	tail -f -s 0.1 /var/log/messages | grep --line-buffered "$IPTABLES_RULE_COMMENT" | while read LINE; do
 		PROTOCOL=$(echo "$LINE" | grep -o -E "PROTO=\w*" | cut -d= -f2) || PROTOCOL=""
 		SOURCE_PORT=$(echo "$LINE" | grep -o -E "SPT=[0-9]+" | cut -d= -f2) || SOURCE_PORT=""
 		LSOF_OUTPUT=$($PRG_LSOF -i ${PROTOCOL}:${SOURCE_PORT} | tail -n+2) || SS_LINE=""
 		if [ -z "$LSOF_OUTPUT" ]; then
-			log "ERROR: request detected, but lsof did not list any process. Consider tuning the tc limitation parameters." force >&2
+			log "ERROR: request detected, but lsof did not list any process. Consider increasing the delay parameter." force >&2
 		else
 			log "PROCESS REQUEST CAPTURED. lsof output: $LSOF_OUTPUT" force
 		fi
