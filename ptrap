@@ -1,15 +1,17 @@
 #!/bin/bash
 set -e
 
-PROGRAM_ID_STRING="ip_message_monitor"
-IPTABLES_RULE_COMMENT="${PROGRAM_ID_STRING}_$$"
+PROGRAM_ID_STRING="netportmon"
+IPTABLES_RULE_COMMENT="${PROGRAM_ID_STRING}$$"
 TC_HANDLE="1:"
-TC_RATE="10bps"
+TC_RATE="20bps"
+TC_CEIL="${TC_RATE}"
 TC_BURST="1"
+TC_CBURST="${TC_BURST}"
 IP_TO_MONITOR=""
 PORT_TO_MONITOR=""
-TCP_MONITOR=""
-UDP_MONITOR=""
+MONITOR_TCP=""
+MONITOR_UDP=""
 VERBOSE=""
 
 print_usage () {
@@ -19,14 +21,22 @@ print_usage () {
 		This program uses iptables rules and tc qdisc to find out which process
 		makes requests to a specific remote IP and port.
 		Currently, only one istance of this script can be executed concurrently.
+		IMPORTANT: for TCP port monitoring, only NEW connection are detected.
 		Parameters:
 		* -h: print this help message
-		* -v: be verbose
+		* -v: be verbose. If unset, only captured process information will be printed out.
 		* -t: monitor TCP connections
 		* -u: monitor UDP messages
 		* -i: remote IP to monitor
 		* -p: remote PORT to monitor
 	EOF
+}
+
+print_failed_dependency () {
+	DEPENDENCY="$1"
+	CONTAINING_PACKAGE="$2"
+	echo "Failed dependency: the \"$DEPENDENCY\" program must be installed to continue." >&2
+	exit -2
 }
 
 log () {
@@ -36,8 +46,12 @@ log () {
 	[ -n "$VERBOSE" -o -n "$FORCE_LOG" ] && echo "$PREFIX $MESSAGE" || true
 }
 
-log "TODO: dependencies are not checked (ip, iptables, tc)." #TODO check dependencies
-log "TODO: PID file currently unimplemented." #TODO setup PID file, to execute ONLY one istance
+PRG_LSOF="$(which lsof)" || print_failed_dependency "lsof"
+PRG_TC="$(which tc)" || print_failed_dependency "tc"
+PRG_IPTABLES="$(which iptables)" || print_failed_dependency "iptables"
+PRG_IP="$(which ip)" || print_failed_dependency "ip"
+
+log "TODO: PID file currently unimplemented. Only ONE instance of this program must be executed concurrently." force >&2 #TODO setup PID file, to execute ONLY one istance
 
 while [ $# -gt 0 ]; do
 	unset OPTIND
@@ -45,11 +59,11 @@ while [ $# -gt 0 ]; do
 		case "$OPTNAME" in
 			"i") IP_TO_MONITOR="$OPTARG";;
 			"p") PORT_TO_MONITOR="$OPTARG";;
-			"t") TCP_MONITOR="y";;
-			"u") UDP_MONITOR="y";;
+			"t") MONITOR_TCP="y";;
+			"u") MONITOR_UDP="y";;
 			"h") print_usage; exit 0;;
 			"v") VERBOSE="y";;
-			*) log "Error during option parsing. Exiting."; exit -1
+			*) log "Error during option parsing. Exiting." force >&2; exit -1
 		esac
 	done
 	shift $((OPTIND-1))
@@ -60,52 +74,53 @@ while [ $# -gt 0 ]; do
 	fi
 done
 
-log "TODO: no sanity check on arguments" force #TODO arguments sanity checks
+log "TODO: no sanity check on arguments" force >&2 #TODO arguments sanity checks
 
-
+PROTOCOLS_TO_MONITOR="${MONITOR_TCP:+tcp} ${MONITOR_UDP:+udp}"
+OUTPUT_INTERFACE="$($PRG_IP route get 10.10.41.71 | head -n1 | grep -o -E "dev \w*\s" | cut -d' ' -f2)"
 log "Program parameters:"
-log "- IP_TO_MONITOR: $IP_TO_MONITOR"
-log "- PORT_TO_MONITOR: $PORT_TO_MONITOR"
-log "- TCP_MONITOR: $TCP_MONITOR"
-log "- UDP_MONITOR: $UDP_MONITOR"
-log "- IPTABLES_RULE_COMMENT: $IPTABLES_RULE_COMMENT"
-log "- PID_FILE: #unimplemented#"
-
-OUTPUT_DEVICE="$(ip route get 10.10.41.71 | head -n1 | grep -o -E "dev \w*\s" | cut -d' ' -f2)"
-log "- OUTPUT_DEVICE: $OUTPUT_DEVICE (auto detected)"
+log "- Ip to monitor: $IP_TO_MONITOR"
+log "- Port to monitor: $PORT_TO_MONITOR"
+log "- Protocols to monitor: $PROTOCOLS_TO_MONITOR"
+log "- iptables rule and match identifier: $IPTABLES_RULE_COMMENT"
+log "- TC parameters: rate=${TC_RATE}, ceil="${TC_CEIL}", burst=${TC_BURST}, cburst=${TC_CBURST}"
+log "- PID file: #unimplemented#"
+log "- Output interface: $OUTPUT_INTERFACE (auto detected)"
+log "- lsof executable path: $PRG_LSOF"
+log "- iptables executable path: $PRG_IPTABLES"
+log "- tc executable path: $PRG_TC"
+log "- ip executable path: $PRG_IP"
 
 setup_tc () {
 	log "Setting up tc..."
-	tc qdisc del dev "$OUTPUT_DEVICE" root || log "No root qdisc present. Skipping."
-	tc qdisc add dev "$OUTPUT_DEVICE" root handle "$TC_HANDLE" htb default 30
-	tc class add dev "$OUTPUT_DEVICE" parent "$TC_HANDLE" classid "${TC_HANDLE}1" htb rate $TC_RATE ceil $TC_RATE burst $TC_BURST cburst $TC_BURST
-	tc filter add dev "$OUTPUT_DEVICE" parent "$TC_HANDLE" protocol ip u32 match ip dst "$IP_TO_MONITOR" flowid "${TC_HANDLE}1" #TODO add ip dport match
+	$PRG_TC qdisc del dev "$OUTPUT_INTERFACE" root 2>/dev/null || log "No root qdisc present. Skipping cleanup."
+	$PRG_TC qdisc add dev "$OUTPUT_INTERFACE" root handle "$TC_HANDLE" htb default 30
+	$PRG_TC class add dev "$OUTPUT_INTERFACE" parent "$TC_HANDLE" classid "${TC_HANDLE}1" htb rate $TC_RATE ceil $TC_CEIL burst $TC_BURST cburst $TC_CBURST
+	log "TODO: currently, all traffic to target host is slowed down, instead of just the target port." force >&2 #TODO add ip dport match
+	$PRG_TC filter add dev "$OUTPUT_INTERFACE" parent "$TC_HANDLE" protocol ip u32 match ip dst "$IP_TO_MONITOR" flowid "${TC_HANDLE}1"
 	log "tc setup complete.."
 }
 teardown_tc() {
 	log "Tearing down tc..."
-	tc qdisc del dev "$OUTPUT_DEVICE" root handle "$TC_HANDLE"
+	$PRG_TC qdisc del dev "$OUTPUT_INTERFACE" root handle "$TC_HANDLE" || log "Error during tc cleanup. Please manually delete tc rule." force >&2
 	log "tc teardown complete.".
 }
 
 setup_iptables() {
 	log "Setting up iptables rules..."
-	PROTOCOLS="${TCP_MONITOR:+tcp} ${UDP_MONITOR:+udp}"
-	log "Protocols to monitor: $PROTOCOLS"
-	for PROTOCOL in $PROTOCOLS; do
-		iptables -v -A OUTPUT -p $PROTOCOL -m comment --comment $IPTABLES_RULE_COMMENT -m $PROTOCOL -d $IP_TO_MONITOR --dport $PORT_TO_MONITOR -j LOG --log-prefix "$IPTABLES_RULE_COMMENT"
-	done
+	[ -n "${MONITOR_UDP}" ] && $PRG_IPTABLES -v -A OUTPUT -p udp -m udp -d "$IP_TO_MONITOR" --dport "$PORT_TO_MONITOR" -j LOG --log-prefix "$IPTABLES_RULE_COMMENT" -m comment --comment "$IPTABLES_RULE_COMMENT"
+	[ -n "${MONITOR_TCP}" ] && $PRG_IPTABLES -v -A OUTPUT -p tcp -m tcp --syn -d "$IP_TO_MONITOR" --dport "$PORT_TO_MONITOR" -j LOG --log-prefix "$IPTABLES_RULE_COMMENT" -m comment --comment "$IPTABLES_RULE_COMMENT"
 	log "iptables rules setup complete."
 }
 teardown_iptables() {
 	log "Tearing down iptables rules..."
 	log "Current rules:"
-	iptables -L OUTPUT --line-numbers | while read LINE; do
+	$PRG_IPTABLES -L OUTPUT --line-numbers | while read LINE; do
 		log "$LINE"
 	done
-	for RULENUMBER in $(iptables -L OUTPUT --line-numbers | grep "$IPTABLES_RULE_COMMENT" | tac | cut -d' ' -f1 | tr '\n' ' '); do
+	for RULENUMBER in $($PRG_IPTABLES -L OUTPUT --line-numbers | grep "$IPTABLES_RULE_COMMENT" | tac | cut -d' ' -f1 | tr '\n' ' '); do
 		log "Deleting rule $RULENUMBER..."
-		iptables -v -D OUTPUT $RULENUMBER
+		$PRG_IPTABLES -v -D OUTPUT $RULENUMBER
 	done
 	log "iptables rules teardown complete."
 }
@@ -113,17 +128,16 @@ teardown_iptables() {
 monitor_syslog() {
 	log "Starting syslog monitoring..."
 	tail -f /var/log/messages | grep --line-buffered "$IPTABLES_RULE_COMMENT" | while read LINE; do
-		SOURCE_PORT=$(echo "$LINE" | grep -o -E "SPT=[0-9]+" | cut -d= -f2)
-		SS_LINE=$(ss -aunp | grep -E ":${SOURCE_PORT}" ) || SS_LINE=""
-		if [ -z "$SS_LINE" ]; then
-			log "ERROR: request detected, but ss did not list any process. Consider lowering the tc bandwidth." forced
+		PROTOCOL=$(echo "$LINE" | grep -o -E "PROTO=\w*" | cut -d= -f2) || PROTOCOL=""
+		SOURCE_PORT=$(echo "$LINE" | grep -o -E "SPT=[0-9]+" | cut -d= -f2) || SOURCE_PORT=""
+		LSOF_OUTPUT=$($PRG_LSOF -i ${PROTOCOL}:${SOURCE_PORT} | tail -n+2) || SS_LINE=""
+		if [ -z "$LSOF_OUTPUT" ]; then
+			log "ERROR: request detected, but lsof did not list any process. Consider tuning the tc limitation parameters." force >&2
 		else
-			log "LINE FOUND, ss line: $SS_LINE" forced
+			log "PROCESS FOUND, LSOF_OUTPUT: $LSOF_OUTPUT" force
 		fi
 	done
 }
-
-echo "OK"
 
 setup () {
 	setup_tc
@@ -133,6 +147,8 @@ teardown () {
 	teardown_iptables
 	teardown_tc
 }
+
+
 
 trap teardown EXIT
 setup
