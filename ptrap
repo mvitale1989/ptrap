@@ -16,48 +16,54 @@ PORT_TO_MONITOR=""
 MONITOR_TCP=""
 MONITOR_UDP=""
 TCP_ONLY_SYN=""
-TCP_PACKETS_PER_MINUTE_DEFAULT="6"
-TCP_PACKETS_PER_MINUTE="${TCP_PACKETS_PER_MINUTE_DEFAULT}"
+PACKETS_PER_MINUTE="20"
 VERBOSE=""
 USER_SCRIPT=""
 
 print_usage () {
 cat <<EOF
-Usage: $0 { [-h] | [-v] { [ -t [ -c | -n packets_per_minute ] ] | [ -u ] } -i ip_to_monitor [-p port_to_monitor] [-s delay_ms] [-e path_to_user_script] }
+Usage: $0 { [-h] | [-v] { -t [ -c ] | -u } -i ip_to_monitor [-p port_to_monitor] [-s delay_ms] [ -n packets_per_minute ] [-e path_to_user_script] }
 
 This program uses iptables rules and tc qdisc to find out which process
-makes requests to a specific remote IP and port.
+sends packets to a specific remote IP and port.
 
 IMPORTANT CONSIDERATIONS:
 * tc rules currently active will be overwritten, at program start
-* only one istance of this script can be executed concurrently
-* for TCP port monitoring, only NEW connection are detected
-* If too many packets are received, this script might not read them fast
-  enough, and some process informations might be lost. If this happens,
-  you might want to consider tuning one of these parameters to prevent it
-  from happening again, in order of preference:
+* Only one istance of this script can be executed concurrently
+* To prevent flooding the application with packets, you can use the "-n"
+  parameter to limit the number of packets that will be matched from a
+  single _source_ socket port. Do note, though, that a single
+  application could still open many sockets to the monitored destination
+  (either tcp or udp) in rapid succession, thus using for each of them a
+  different source port, eluding the packet limit configured with the
+  "-n" flag. In such a situation, flooding could still happen.
+* If too many packets are received (flooding), this script might not read them
+  fast enough, and the sending process could die before this application could
+  poll the system for informations. If this happens, you might want to consider
+  tuning one of these parameters, to lower the chances of that happening again.
+  In order of preference:
     1. Increase the delay_ms parameter
     2. If using a user script, optimize its execution time
     3. Edit the TAIL_INTERVAL_S on the top of this script
   Be aware, however, that this program relies on the process being still
   alive and waiting for response, after sending an IP packet. If a
   program sends a packet and then immediately dies, without even waiting
-  for response, this program won't be able to detect it.
-* The user script is executed synchronously. To not lose any packet, its
-  execution time should be kept at minimum.
+  for response, this program won't be able to gather informations about it.
+* The user script is executed synchronously. To minimize the probability of
+  packet loss, its execution time should be kept at minimum.
 
 Parameters:
 * -h: print this help message
 * -v: be verbose. If unset, only captured process information will be printed out.
 * -t: monitor TCP packets
-* -c: when monitoring TCP packets, detect only new connections
-* -n: when monitoring TCP packets, specify how many packets must be matched at
-      most per minute, to prevent flooding, for each requesting application.
-      Default value is 10. Important: only works when not using the "-c" flags.
+* -c: when monitoring TCP packets, match only new connections
 * -u: monitor UDP messages
-* -i: remote IP to monitor
-* -p: remote PORT to monitor
-* -s: delay time for matching packets, in milliseconds. default 500
+* -i: monitor packets destined to this IP address
+* -p: monitor packets destined to this remote PORT
+* -s: delay outgoing matching packets, in milliseconds. Default 500
+* -n: specify how many packets must be matched at most per minute. Please read
+      the important considerations, concerning its effectiveness in preventing
+      packet flooding. Default value is 20.
 * -e: path to user script, to execute on packet match. The PID of the
       sending process will be passed to it as parameters.
 EOF
@@ -96,7 +102,7 @@ while [ $# -gt 0 ]; do
 			"s") TC_DELAY_MS="$OPTARG";;
 			"e") USER_SCRIPT="$OPTARG";;
 			"c") TCP_ONLY_SYN="y";;
-			"n") TCP_PACKETS_PER_MINUTE="$OPTARG";;
+			"n") PACKETS_PER_MINUTE="$OPTARG";;
 			*) log "Error during option parsing. Exiting." force >&2; exit -1
 		esac
 	done
@@ -116,27 +122,19 @@ elif [ -z "$MONITOR_TCP" -a -z "$MONITOR_UDP" ]; then
 	echo "Select at least one IP protocol to monitor (see options -t and -u)." >&2
 	print_usage
 	exit -4
-elif [ -z "$MONITOR_TCP" ]; then
-	if [ -n "$TCP_ONLY_SYN" -o "$TCP_PACKETS_PER_MINUTE" != "$TCP_PACKETS_PER_MINUTE_DEFAULT" ]; then
-		echo "You must listen for TCP packets (flag -t), in order to use flags -c or -n." >&2
-		print_usage
-		exit -5
-	fi
+elif [ -z "$MONITOR_TCP" -a -n "$TCP_ONLY_SYN" ]; then
+	echo "You must listen for TCP packets (flag -t), in order to use flag -c." >&2
+	print_usage
+	exit -5
 fi
 
 PROTOCOLS_TO_MONITOR="${MONITOR_TCP:+tcp} ${MONITOR_UDP:+udp}"
 OUTPUT_INTERFACE="$($PRG_IP route get 10.10.41.71 | head -n1 | grep -o -E "dev \w*\s" | cut -d' ' -f2)"
 log "Program parameters:"
 log "- Ip to monitor: $IP_TO_MONITOR"
-log "- Port to monitor: ${PORT_TO_MONITOR:+any}"
-log "- Protocols to monitor: $PROTOCOLS_TO_MONITOR"
-if [ -n "$MONITOR_TCP" ]; then
-	if [ -n "$TCP_ONLY_SYN" ]; then
-		log "- tcp option: only new connections will be matched"
-	else
-		log "- tcp option: every tcp packet will be matched (max $TCP_PACKETS_PER_MINUTE per minute)"
-	fi
-fi
+log "- Port to monitor: ${PORT_TO_MONITOR:-any}"
+log "- Protocols to monitor: $PROTOCOLS_TO_MONITOR ${TCP_ONLY_SYN:+(for tcp, only new connections will be matched)}"
+log "- Max packets per minute matched, from a single local source port: $PACKETS_PER_MINUTE"
 log "- iptables rule and match identifier: $IPTABLES_RULE_COMMENT"
 log "- TC parameters for netem qdisc: delay ${TC_DELAY_MS}"
 log "- Output interface: $OUTPUT_INTERFACE (auto detected)"
@@ -145,7 +143,7 @@ log "- iptables executable path: $PRG_IPTABLES"
 log "- tc executable path: $PRG_TC"
 log "- ip executable path: $PRG_IP"
 log "- lock directory: $LOCK_DIRECTORY"
-log "- User script: ${USER_SCRIPT}"
+log "- User script: ${USER_SCRIPT:-none}"
 
 setup_tc () {
 	log "Setting up tc..."
@@ -166,8 +164,8 @@ teardown_tc() {
 setup_iptables() {
 	log "Setting up iptables rules..."
 	SYN_ARGS=$( [ -n "$TCP_ONLY_SYN" ] && echo -n "--syn" || echo -n "" )
-	HASHLIMIT_ARGS=$( [ -z "$TCP_ONLY_SYN" ] && echo -n '-m hashlimit --hashlimit '"${TCP_PACKETS_PER_MINUTE}"'/minute --hashlimit-burst 1 --hashlimit-mode dstip,srcport --hashlimit-name '"$PROGRAM_ID_STRING" || echo -n "" )
-	[ -n "${MONITOR_UDP}" ] && $PRG_IPTABLES -A OUTPUT -p udp -m udp -d "$IP_TO_MONITOR" ${PORT_TO_MONITOR:+--dport "$PORT_TO_MONITOR"} -j LOG --log-prefix "$IPTABLES_RULE_COMMENT" -m comment --comment "$IPTABLES_RULE_COMMENT"
+	HASHLIMIT_ARGS='-m hashlimit --hashlimit '"${PACKETS_PER_MINUTE}"'/minute --hashlimit-burst 1 --hashlimit-mode dstip,srcport --hashlimit-name '"$PROGRAM_ID_STRING"
+	[ -n "${MONITOR_UDP}" ] && $PRG_IPTABLES -A OUTPUT -p udp -m udp -d "$IP_TO_MONITOR" ${PORT_TO_MONITOR:+--dport "$PORT_TO_MONITOR"} -j LOG --log-prefix "$IPTABLES_RULE_COMMENT" -m comment --comment "$IPTABLES_RULE_COMMENT" ${HASHLIMIT_ARGS}
  	[ -n "${MONITOR_TCP}" ] && $PRG_IPTABLES -A OUTPUT -p tcp -m tcp ${SYN_ARGS} -d "$IP_TO_MONITOR" ${PORT_TO_MONITOR:+--dport "$PORT_TO_MONITOR"} -j LOG --log-prefix "$IPTABLES_RULE_COMMENT" -m comment --comment "$IPTABLES_RULE_COMMENT" ${HASHLIMIT_ARGS}
 	log "iptables rules setup complete."
 }
