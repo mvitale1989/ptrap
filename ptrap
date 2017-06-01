@@ -1,12 +1,7 @@
 #!/bin/bash
 set -e
 
-# AREAS OF IMPROVEMENTS
-# - Monitor other IP protocols (e.g. icmp)
-# - Save and restore of tc rules
-# - Concurrent execution of multiple istances of this program
-
-PROGRAM_ID_STRING="netportmon"
+PROGRAM_ID_STRING="ptrap"
 IPTABLES_IDENTIFIER="${PROGRAM_ID_STRING}$$"
 LOCK_DIRECTORY="/var/run/$PROGRAM_ID_STRING"
 TC_DELAY_MS="500"
@@ -28,6 +23,9 @@ This program uses iptables rules and tc qdisc to find out which process
 sends packets to a specific remote IP and port.
 
 IMPORTANT CONSIDERATIONS:
+* As it relies on iptables rules and tc qdisc to capture traffic, root
+  privileges are required.
+* syslog is expected to log out to `/var/log/messages`
 * tc rules currently active will be overwritten, at program start
 * Only one istance of this script can be executed concurrently
 * To prevent flooding the application with packets, you can use the "-n"
@@ -73,7 +71,7 @@ print_failed_dependency () {
 	DEPENDENCY="$1"
 	CONTAINING_PACKAGE="$2"
 	echo "Failed dependency: the \"$DEPENDENCY\" program must be installed to continue." >&2
-	exit -2
+	exit 2
 }
 
 log () {
@@ -103,7 +101,7 @@ while [ $# -gt 0 ]; do
 			"e") USER_SCRIPT="$OPTARG";;
 			"c") TCP_ONLY_SYN="y";;
 			"n") PACKETS_PER_MINUTE="$OPTARG";;
-			*) log "Error during option parsing. Exiting." force >&2; exit -1
+			*) log "Error during option parsing. Exiting." force >&2; exit 1
 		esac
 	done
 	shift $((OPTIND-1))
@@ -117,15 +115,23 @@ done
 if [ -z "$IP_TO_MONITOR" ]; then
 	echo "No target ip defined." >&2
 	print_usage
-	exit -3
+	exit 3
 elif [ -z "$MONITOR_TCP" -a -z "$MONITOR_UDP" ]; then
 	echo "Select at least one IP protocol to monitor (see options -t and -u)." >&2
 	print_usage
-	exit -4
+	exit 4
 elif [ -z "$MONITOR_TCP" -a -n "$TCP_ONLY_SYN" ]; then
 	echo "You must listen for TCP packets (flag -t), in order to use flag -c." >&2
 	print_usage
-	exit -5
+	exit 5
+elif [ $(id -u) -ne 0 ]; then
+  echo "You must be root to execute this script." >&2
+  exit 6
+elif [ ! -f /var/log/messages ]; then
+  echo "'/var/log/message' was not found." >&2
+  echo "This program depends on syslog outputting messages to that file." >&2
+  echo "Please configure your system accordingly." >&2
+  exit 8
 fi
 
 PROTOCOLS_TO_MONITOR="${MONITOR_TCP:+tcp} ${MONITOR_UDP:+udp}"
@@ -194,7 +200,7 @@ setup_lock_directory () {
 	else
 		log "Error: lock directory already present ad $LOCK_DIRECTORY." force >&2
 		log "If another instance is not running, it is stale and can be removed manually with \"rmdir $LOCK_DIRECTORY\"." force >&2
-		exit -1
+		exit 7
 	fi
 }
 
