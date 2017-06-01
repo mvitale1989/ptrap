@@ -7,7 +7,7 @@ set -e
 # - Concurrent execution of multiple istances of this program
 
 PROGRAM_ID_STRING="netportmon"
-IPTABLES_RULE_COMMENT="${PROGRAM_ID_STRING}$$"
+IPTABLES_IDENTIFIER="${PROGRAM_ID_STRING}$$"
 LOCK_DIRECTORY="/var/run/$PROGRAM_ID_STRING"
 TC_DELAY_MS="500"
 TAIL_INTERVAL_S="0.1"
@@ -135,7 +135,7 @@ log "- Ip to monitor: $IP_TO_MONITOR"
 log "- Port to monitor: ${PORT_TO_MONITOR:-any}"
 log "- Protocols to monitor: $PROTOCOLS_TO_MONITOR ${TCP_ONLY_SYN:+(for tcp, only new connections will be matched)}"
 log "- Max packets per minute matched, from a single local source port: $PACKETS_PER_MINUTE"
-log "- iptables rule and match identifier: $IPTABLES_RULE_COMMENT"
+log "- iptables rule chain and match identifier: $IPTABLES_IDENTIFIER"
 log "- TC parameters for netem qdisc: delay ${TC_DELAY_MS}"
 log "- Output interface: $OUTPUT_INTERFACE (auto detected)"
 log "- lsof executable path: $PRG_LSOF"
@@ -164,9 +164,11 @@ teardown_tc() {
 setup_iptables() {
 	log "Setting up iptables rules..."
 	SYN_ARGS=$( [ -n "$TCP_ONLY_SYN" ] && echo -n "--syn" || echo -n "" )
-	HASHLIMIT_ARGS='-m hashlimit --hashlimit '"${PACKETS_PER_MINUTE}"'/minute --hashlimit-burst 1 --hashlimit-mode dstip,srcport --hashlimit-name '"$PROGRAM_ID_STRING"
-	[ -n "${MONITOR_UDP}" ] && $PRG_IPTABLES -A OUTPUT -p udp -m udp -d "$IP_TO_MONITOR" ${PORT_TO_MONITOR:+--dport "$PORT_TO_MONITOR"} -j LOG --log-prefix "$IPTABLES_RULE_COMMENT" -m comment --comment "$IPTABLES_RULE_COMMENT" ${HASHLIMIT_ARGS}
- 	[ -n "${MONITOR_TCP}" ] && $PRG_IPTABLES -A OUTPUT -p tcp -m tcp ${SYN_ARGS} -d "$IP_TO_MONITOR" ${PORT_TO_MONITOR:+--dport "$PORT_TO_MONITOR"} -j LOG --log-prefix "$IPTABLES_RULE_COMMENT" -m comment --comment "$IPTABLES_RULE_COMMENT" ${HASHLIMIT_ARGS}
+	HASHLIMIT_ARGS='-m hashlimit --hashlimit '"${PACKETS_PER_MINUTE}"'/minute --hashlimit-burst 1 --hashlimit-mode srcip,dstip,srcport --hashlimit-name '"$PROGRAM_ID_STRING"
+	$PRG_IPTABLES -N "$IPTABLES_IDENTIFIER"
+	[ -n "${MONITOR_UDP}" ] && $PRG_IPTABLES -A "$IPTABLES_IDENTIFIER" -p udp -m udp -d "$IP_TO_MONITOR" ${PORT_TO_MONITOR:+--dport "$PORT_TO_MONITOR"} -j LOG --log-prefix "$IPTABLES_IDENTIFIER" ${HASHLIMIT_ARGS}_udp
+ 	[ -n "${MONITOR_TCP}" ] && $PRG_IPTABLES -A "$IPTABLES_IDENTIFIER" -p tcp -m tcp ${SYN_ARGS} -d "$IP_TO_MONITOR" ${PORT_TO_MONITOR:+--dport "$PORT_TO_MONITOR"} -j LOG --log-prefix "$IPTABLES_IDENTIFIER" ${HASHLIMIT_ARGS}_tcp
+	$PRG_IPTABLES -I OUTPUT -j "$IPTABLES_IDENTIFIER" -m comment --comment "$IPTABLES_IDENTIFIER"
 	log "iptables rules setup complete."
 }
 teardown_iptables() {
@@ -175,10 +177,12 @@ teardown_iptables() {
 	$PRG_IPTABLES -L OUTPUT --line-numbers | while read LINE; do
 		log "$LINE"
 	done
-	for RULENUMBER in $($PRG_IPTABLES -L OUTPUT --line-numbers | grep "$IPTABLES_RULE_COMMENT" | tac | cut -d' ' -f1 | tr '\n' ' '); do
+	for RULENUMBER in $($PRG_IPTABLES -L OUTPUT --line-numbers | grep "$IPTABLES_IDENTIFIER" | tac | cut -d' ' -f1 | tr '\n' ' '); do
 		log "Deleting rule $RULENUMBER..."
 		$PRG_IPTABLES -D OUTPUT $RULENUMBER
 	done
+	iptables -F "$IPTABLES_IDENTIFIER"
+	iptables -X "$IPTABLES_IDENTIFIER"
 	log "iptables rules teardown complete."
 }
 
@@ -202,7 +206,7 @@ teardown_lock_directory () {
 
 monitor_syslog() {
 	log "Starting syslog monitoring..."
-	tail -f -s "$TAIL_INTERVAL_S" /var/log/messages | grep --line-buffered "$IPTABLES_RULE_COMMENT" | while read LINE; do
+	tail -f -s "$TAIL_INTERVAL_S" /var/log/messages | grep --line-buffered "$IPTABLES_IDENTIFIER" | while read LINE; do
 		PROTOCOL=$(echo "$LINE" | grep -o -E "PROTO=\w*" | cut -d= -f2) || PROTOCOL=""
 		SOURCE_PORT=$(echo "$LINE" | grep -o -E "SPT=[0-9]+" | cut -d= -f2) || SOURCE_PORT=""
 		MATCHING_PID=$($PRG_LSOF -i ${PROTOCOL}:${SOURCE_PORT} | tail -n1 | awk '{print $2}') || MATCHING_PID=""
