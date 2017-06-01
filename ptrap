@@ -1,6 +1,11 @@
 #!/bin/bash
 set -e
 
+# AREAS OF IMPROVEMENTS
+# - Save and restore of tc rules
+# - Concurrent execution of multiple istances of this program
+# - Detection of packets from already active connections (iptables "-m hashlimit")
+
 PROGRAM_ID_STRING="netportmon"
 IPTABLES_RULE_COMMENT="${PROGRAM_ID_STRING}$$"
 LOCK_DIRECTORY="/var/run/$PROGRAM_ID_STRING"
@@ -21,8 +26,12 @@ print_usage () {
 
 		This program uses iptables rules and tc qdisc to find out which process
 		makes requests to a specific remote IP and port.
-		Currently, only one istance of this script can be executed concurrently.
-		IMPORTANT: for TCP port monitoring, only NEW connection are detected.
+
+		IMPORTANT CONSIDERATIONS:
+		* tc rules currently active will be overwritten, at program start
+		* only one istance of this script can be executed concurrently
+		* for TCP port monitoring, only NEW connection are detected
+
 		Parameters:
 		* -h: print this help message
 		* -v: be verbose. If unset, only captured process information will be printed out.
@@ -97,8 +106,8 @@ setup_tc () {
 	$PRG_TC qdisc del dev "$OUTPUT_INTERFACE" root 2>/dev/null || log "No root qdisc present. Skipping cleanup."
 	$PRG_TC qdisc add dev "$OUTPUT_INTERFACE" root handle "$TC_HANDLE" htb default 30
 	$PRG_TC class add dev "$OUTPUT_INTERFACE" parent "$TC_HANDLE" classid "${TC_HANDLE}1" htb rate $TC_RATE ceil $TC_CEIL burst $TC_BURST cburst $TC_CBURST
-	log "TODO: currently, all traffic to target host is slowed down, instead of just the target port." force >&2 #TODO add ip dport match
-	$PRG_TC filter add dev "$OUTPUT_INTERFACE" parent "$TC_HANDLE" protocol ip u32 match ip dst "$IP_TO_MONITOR" flowid "${TC_HANDLE}1"
+	[ -n "$MONITOR_UDP" ] && $PRG_TC filter add dev "$OUTPUT_INTERFACE" parent "$TC_HANDLE" protocol ip u32 match ip dst "$IP_TO_MONITOR" match ip protocol 17 FF match ip dport "$PORT_TO_MONITOR" FFFF flowid "${TC_HANDLE}1"
+	[ -n "$MONITOR_TCP" ] && $PRG_TC filter add dev "$OUTPUT_INTERFACE" parent "$TC_HANDLE" protocol ip u32 match ip dst "$IP_TO_MONITOR" match ip protocol 6 FF match ip dport "$PORT_TO_MONITOR" FFFF flowid "${TC_HANDLE}1"
 	log "tc setup complete.."
 }
 teardown_tc() {
@@ -146,7 +155,7 @@ teardown_lock_directory () {
 
 monitor_syslog() {
 	log "Starting syslog monitoring..."
-	tail -f /var/log/messages | grep --line-buffered "$IPTABLES_RULE_COMMENT" | while read LINE; do
+	tail -f -s 0.2 /var/log/messages | grep --line-buffered "$IPTABLES_RULE_COMMENT" | while read LINE; do
 		PROTOCOL=$(echo "$LINE" | grep -o -E "PROTO=\w*" | cut -d= -f2) || PROTOCOL=""
 		SOURCE_PORT=$(echo "$LINE" | grep -o -E "SPT=[0-9]+" | cut -d= -f2) || SOURCE_PORT=""
 		LSOF_OUTPUT=$($PRG_LSOF -i ${PROTOCOL}:${SOURCE_PORT} | tail -n+2) || SS_LINE=""
