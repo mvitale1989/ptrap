@@ -2,6 +2,7 @@
 set -e
 
 # AREAS OF IMPROVEMENTS
+# - Monitor other IP protocols (e.g. icmp)
 # - Save and restore of tc rules
 # - Concurrent execution of multiple istances of this program
 # - Detection of packets from already active connections (iptables "-m hashlimit")
@@ -22,7 +23,7 @@ VERBOSE=""
 
 print_usage () {
 	cat <<-EOF
-		Usage: $0 { [-h] | [-v] [-t] [-u] -i ip_to_monitor [-p port_to_monitor] }
+		Usage: $0 { [-h] | [-v] { [-t] | [-u] } -i ip_to_monitor [-p port_to_monitor] }
 
 		This program uses iptables rules and tc qdisc to find out which process
 		makes requests to a specific remote IP and port.
@@ -56,12 +57,11 @@ log () {
 	[ -n "$VERBOSE" -o -n "$FORCE_LOG" ] && echo "$PREFIX $MESSAGE" || true
 }
 
+
 PRG_LSOF="$(which lsof)" || print_failed_dependency "lsof"
 PRG_TC="$(which tc)" || print_failed_dependency "tc"
 PRG_IPTABLES="$(which iptables)" || print_failed_dependency "iptables"
 PRG_IP="$(which ip)" || print_failed_dependency "ip"
-
-log "TODO: the tc burst feature prevents the first packet from being slowed down, thus losing it. A \"token bucket drainer\" subprocess will be implemented." force >&2 #TODO implement TBF drainer process
 
 while [ $# -gt 0 ]; do
 	unset OPTIND
@@ -84,13 +84,23 @@ while [ $# -gt 0 ]; do
 	fi
 done
 
-log "TODO: no sanity check on arguments" force >&2 #TODO arguments sanity checks
+if [ -z "$IP_TO_MONITOR" ]; then
+	echo "No target ip defined." >&2
+	print_usage
+	exit -3
+elif [ -z "$MONITOR_TCP" -a -z "$MONITOR_UDP" ]; then
+	echo "Select at least one IP protocol to monitor (see options -t and -u)." >&2
+	print_usage
+	exit -4
+fi
+
+log "TODO: the tc burst feature prevents the first packet from being slowed down, thus losing it. A \"token bucket drainer\" subprocess will be implemented." force >&2 #TODO implement TBF drainer process
 
 PROTOCOLS_TO_MONITOR="${MONITOR_TCP:+tcp} ${MONITOR_UDP:+udp}"
 OUTPUT_INTERFACE="$($PRG_IP route get 10.10.41.71 | head -n1 | grep -o -E "dev \w*\s" | cut -d' ' -f2)"
 log "Program parameters:"
 log "- Ip to monitor: $IP_TO_MONITOR"
-log "- Port to monitor: $PORT_TO_MONITOR"
+log "- Port to monitor: ${PORT_TO_MONITOR:+any}"
 log "- Protocols to monitor: $PROTOCOLS_TO_MONITOR"
 log "- iptables rule and match identifier: $IPTABLES_RULE_COMMENT"
 log "- TC parameters: rate=${TC_RATE}, ceil="${TC_CEIL}", burst=${TC_BURST}, cburst=${TC_CBURST}"
@@ -103,11 +113,12 @@ log "- lock directory: $LOCK_DIRECTORY"
 
 setup_tc () {
 	log "Setting up tc..."
+	U32_CMD="$PRG_TC filter add dev $OUTPUT_INTERFACE parent $TC_HANDLE protocol ip u32"
 	$PRG_TC qdisc del dev "$OUTPUT_INTERFACE" root 2>/dev/null || log "No root qdisc present. Skipping cleanup."
 	$PRG_TC qdisc add dev "$OUTPUT_INTERFACE" root handle "$TC_HANDLE" htb default 30
 	$PRG_TC class add dev "$OUTPUT_INTERFACE" parent "$TC_HANDLE" classid "${TC_HANDLE}1" htb rate $TC_RATE ceil $TC_CEIL burst $TC_BURST cburst $TC_CBURST
-	[ -n "$MONITOR_UDP" ] && $PRG_TC filter add dev "$OUTPUT_INTERFACE" parent "$TC_HANDLE" protocol ip u32 match ip dst "$IP_TO_MONITOR" match ip protocol 17 FF match ip dport "$PORT_TO_MONITOR" FFFF flowid "${TC_HANDLE}1"
-	[ -n "$MONITOR_TCP" ] && $PRG_TC filter add dev "$OUTPUT_INTERFACE" parent "$TC_HANDLE" protocol ip u32 match ip dst "$IP_TO_MONITOR" match ip protocol 6 FF match ip dport "$PORT_TO_MONITOR" FFFF flowid "${TC_HANDLE}1"
+	[ -n "$MONITOR_UDP" ] && $U32_CMD match ip dst "$IP_TO_MONITOR" match ip protocol 17 FF ${PORT_TO_MONITOR:+match ip dport "$PORT_TO_MONITOR" FFFF} flowid "${TC_HANDLE}1"
+	[ -n "$MONITOR_TCP" ] && $U32_CMD match ip dst "$IP_TO_MONITOR" match ip protocol 6 FF ${PORT_TO_MONITOR:+match ip dport "$PORT_TO_MONITOR" FFFF} flowid "${TC_HANDLE}1"
 	log "tc setup complete.."
 }
 teardown_tc() {
@@ -118,8 +129,8 @@ teardown_tc() {
 
 setup_iptables() {
 	log "Setting up iptables rules..."
-	[ -n "${MONITOR_UDP}" ] && $PRG_IPTABLES -v -A OUTPUT -p udp -m udp -d "$IP_TO_MONITOR" --dport "$PORT_TO_MONITOR" -j LOG --log-prefix "$IPTABLES_RULE_COMMENT" -m comment --comment "$IPTABLES_RULE_COMMENT"
-	[ -n "${MONITOR_TCP}" ] && $PRG_IPTABLES -v -A OUTPUT -p tcp -m tcp --syn -d "$IP_TO_MONITOR" --dport "$PORT_TO_MONITOR" -j LOG --log-prefix "$IPTABLES_RULE_COMMENT" -m comment --comment "$IPTABLES_RULE_COMMENT"
+	[ -n "${MONITOR_UDP}" ] && $PRG_IPTABLES -v -A OUTPUT -p udp -m udp -d "$IP_TO_MONITOR" ${PORT_TO_MONITOR:+--dport "$PORT_TO_MONITOR"} -j LOG --log-prefix "$IPTABLES_RULE_COMMENT" -m comment --comment "$IPTABLES_RULE_COMMENT"
+	[ -n "${MONITOR_TCP}" ] && $PRG_IPTABLES -v -A OUTPUT -p tcp -m tcp --syn -d "$IP_TO_MONITOR" ${PORT_TO_MONITOR:+--dport "$PORT_TO_MONITOR"} -j LOG --log-prefix "$IPTABLES_RULE_COMMENT" -m comment --comment "$IPTABLES_RULE_COMMENT"
 	log "iptables rules setup complete."
 }
 teardown_iptables() {
