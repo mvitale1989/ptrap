@@ -3,6 +3,7 @@ set -e
 
 PROGRAM_ID_STRING="netportmon"
 IPTABLES_RULE_COMMENT="${PROGRAM_ID_STRING}$$"
+LOCK_DIRECTORY="/var/run/$PROGRAM_ID_STRING"
 TC_HANDLE="1:"
 TC_RATE="20bps"
 TC_CEIL="${TC_RATE}"
@@ -51,7 +52,7 @@ PRG_TC="$(which tc)" || print_failed_dependency "tc"
 PRG_IPTABLES="$(which iptables)" || print_failed_dependency "iptables"
 PRG_IP="$(which ip)" || print_failed_dependency "ip"
 
-log "TODO: PID file currently unimplemented. Only ONE instance of this program must be executed concurrently." force >&2 #TODO setup PID file, to execute ONLY one istance
+log "TODO: the tc burst feature prevents the first packet from being slowed down, thus losing it. A \"token bucket drainer\" subprocess will be implemented." force >&2 #TODO implement TBF drainer process
 
 while [ $# -gt 0 ]; do
 	unset OPTIND
@@ -84,12 +85,12 @@ log "- Port to monitor: $PORT_TO_MONITOR"
 log "- Protocols to monitor: $PROTOCOLS_TO_MONITOR"
 log "- iptables rule and match identifier: $IPTABLES_RULE_COMMENT"
 log "- TC parameters: rate=${TC_RATE}, ceil="${TC_CEIL}", burst=${TC_BURST}, cburst=${TC_CBURST}"
-log "- PID file: #unimplemented#"
 log "- Output interface: $OUTPUT_INTERFACE (auto detected)"
 log "- lsof executable path: $PRG_LSOF"
 log "- iptables executable path: $PRG_IPTABLES"
 log "- tc executable path: $PRG_TC"
 log "- ip executable path: $PRG_IP"
+log "- lock directory: $LOCK_DIRECTORY"
 
 setup_tc () {
 	log "Setting up tc..."
@@ -125,6 +126,24 @@ teardown_iptables() {
 	log "iptables rules teardown complete."
 }
 
+setup_lock_directory () {
+	#IMPROVE also add PID to directory, to allow stale lock check
+	log "Creating lock directory..."
+	if mkdir "$LOCK_DIRECTORY"; then
+		log "Lock directory created successfully."
+	else
+		log "Error: lock directory already present ad $LOCK_DIRECTORY." force >&2
+		log "If another instance is not running, it is stale and can be removed manually with \"rmdir $LOCK_DIRECTORY\"." force >&2
+		exit -1
+	fi
+}
+
+teardown_lock_directory () {
+	log "Removing lock directory..."
+	rmdir "$LOCK_DIRECTORY"
+	log "Lock directory removed successfully."
+}
+
 monitor_syslog() {
 	log "Starting syslog monitoring..."
 	tail -f /var/log/messages | grep --line-buffered "$IPTABLES_RULE_COMMENT" | while read LINE; do
@@ -146,10 +165,11 @@ setup () {
 teardown () {
 	teardown_iptables
 	teardown_tc
+	teardown_lock_directory
 }
 
 
-
+setup_lock_directory
 trap teardown EXIT
 setup
 monitor_syslog
