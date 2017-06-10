@@ -23,6 +23,8 @@ This program uses iptables rules and tc qdisc to find out which process
 sends packets to a specific remote IP and port.
 
 Important considerations:
+* Any traffic directed to the monitored IP/port will be delayed according to the
+  `-s` parameter.
 * Your current `tc` configuration will be overwritten, at program start.
 * A chatty application may exchange many packets per seconds with a single
   destination. To prevent flooding this script with packets that belong to the
