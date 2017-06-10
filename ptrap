@@ -22,33 +22,21 @@ Usage: $0 { [-h] | [-v] { -t [ -c ] | -u } -i ip_to_monitor [-p port_to_monitor]
 This program uses iptables rules and tc qdisc to find out which process
 sends packets to a specific remote IP and port.
 
-IMPORTANT CONSIDERATIONS:
-* As it relies on iptables rules and tc qdisc to capture traffic, root
-  privileges are required.
-* syslog is expected to log out to `/var/log/messages`
-* tc rules currently active will be overwritten, at program start
-* Only one istance of this script can be executed concurrently
-* To prevent flooding the application with packets, you can use the "-n"
-  parameter to limit the number of packets that will be matched from a
-  single _source_ socket port. Do note, though, that a single
-  application could still open many sockets to the monitored destination
-  (either tcp or udp) in rapid succession, thus using for each of them a
-  different source port, eluding the packet limit configured with the
-  "-n" flag. In such a situation, flooding could still happen.
-* If too many packets are received (flooding), this script might not read them
-  fast enough, and the sending process could die before this application could
-  poll the system for informations. If this happens, you might want to consider
-  tuning one of these parameters, to lower the chances of that happening again.
-  In order of preference:
-    1. Increase the delay_ms parameter
-    2. If using a user script, optimize its execution time
-    3. Edit the TAIL_INTERVAL_S on the top of this script
-  Be aware, however, that this program relies on the process being still
-  alive and waiting for response, after sending an IP packet. If a
-  program sends a packet and then immediately dies, without even waiting
-  for response, this program won't be able to gather informations about it.
-* The user script is executed synchronously. To minimize the probability of
-  packet loss, its execution time should be kept at minimum.
+Important considerations:
+* Your current `tc` configuration will be overwritten, at program start.
+* A chatty application may exchange many packets per seconds with a single
+  destination. To prevent flooding this script with packets that belong to the
+  same connection (and, consequently to the same process), you can use the `-n`
+  flag to limit the max number of matches per minute for a single connection;
+  however, if an application  generates a lot of traffic by opening _new_
+  connections (thus using many different source ports in rapid succession)
+  flooding could still happen.
+* If too many packets are captured in a short time (flooding), this script might
+  not read them fast enough, and for some of them the sending process could die
+  before the system could be queried for informations about the sending process.
+  In such a case, and in other special cases (e.g. the sending process
+  immediately exits after sending the packet, without waiting for a response),
+  this program may not be able to return informations about the sending process.
 
 Parameters:
 * -h: print this help message
