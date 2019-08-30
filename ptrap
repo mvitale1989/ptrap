@@ -125,7 +125,7 @@ elif [ ! -f /var/log/messages ]; then
 fi
 
 PROTOCOLS_TO_MONITOR="${MONITOR_TCP:+tcp} ${MONITOR_UDP:+udp}"
-OUTPUT_INTERFACE="$($PRG_IP route get 10.10.41.71 | head -n1 | grep -o -E "dev \w*\s" | cut -d' ' -f2)"
+OUTPUT_INTERFACE="$($PRG_IP route get 10.10.41.71 | head -n1 | grep -o -P "dev \w*\s" | cut -d' ' -f2)"
 log "Program parameters:"
 log "- Ip to monitor: $IP_TO_MONITOR"
 log "- Port to monitor: ${PORT_TO_MONITOR:-any}"
@@ -203,8 +203,8 @@ teardown_lock_directory () {
 monitor_syslog() {
 	log "Starting syslog monitoring..."
 	tail -f -s "$TAIL_INTERVAL_S" /var/log/messages | grep --line-buffered "$IPTABLES_IDENTIFIER" | while read LINE; do
-		PROTOCOL=$(echo "$LINE" | grep -o -E "PROTO=\w*" | cut -d= -f2) || PROTOCOL=""
-		SOURCE_PORT=$(echo "$LINE" | grep -o -E "SPT=[0-9]+" | cut -d= -f2) || SOURCE_PORT=""
+		PROTOCOL=$(echo "$LINE" | grep -o -P "PROTO=\w*" | cut -d= -f2) || PROTOCOL=""
+		SOURCE_PORT=$(echo "$LINE" | grep -o -P "SPT=[0-9]+" | cut -d= -f2) || SOURCE_PORT=""
 		MATCHING_PID=$($PRG_LSOF -i ${PROTOCOL}:${SOURCE_PORT} | tail -n1 | awk '{print $2}') || MATCHING_PID=""
 		if [ -z "$MATCHING_PID" ]; then
 			log "ERROR: request detected, but lsof did not list any process. Read the program help for tips on how to avoid this." force >&2
